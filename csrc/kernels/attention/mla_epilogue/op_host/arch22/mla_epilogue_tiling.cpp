@@ -42,6 +42,9 @@ constexpr size_t WORKSPACE_NUM = 1U;
 constexpr uint64_t UB_RESERVED_SIZE = 8192ULL;      // 框架预留
 constexpr uint64_t ROPE_ROW_UB = 16384ULL;          // 每行双缓冲 xTile：2 × 4096 × 2 B
 constexpr uint64_t ROPE_FIXED_UB = 5888ULL;         // ropeF32 + swapF32 + cos/sin 双缓冲 + 3 个辅助向量
+// 设备内 ND→NZ 预转换（大 S 门控）：AIV 用 UB 暂存按 32 B 块做跨行搬运。
+constexpr uint32_t NZ_CONV_MIN_S = 8192U;           // 只有 S >= 该值才做转换（转换成本 ~468us）
+constexpr uint64_t NZ_STAGE_UB = 32768ULL;          // 2 × 16 KiB 双缓冲暂存（v1）
 constexpr uint32_t TILE_S_CAP = 8U;                 // 设计余量封顶
 constexpr uint32_t WS_ALIGN = 512U;
 
@@ -387,16 +390,24 @@ static ge::graphStatus TilingMlaEpilogue(gert::TilingContext* context)
         tileS = tileSMax;
     }
     const uint32_t sTileNum = CeilDivU32(pipeTileRows, tileS);
-    const uint32_t ropeTaskNum = MLA_G * sTileNum;
+    // Row-major RoPE：每个任务处理一整行的全部 8 个 group，cos/sin 每行只加载一次。
+    const uint32_t ropeTaskNum = pipeTileRows;
     const uint32_t ropeTasksPerCore = CeilDivU32(ropeTaskNum, aivNum);
     const uint32_t aivUsedCores = CeilDivU32(ropeTaskNum, ropeTasksPerCore);
 
-    // RoPE UB 峰值核算（AIC/AIV 独立核算口径）
-    const uint64_t ropeUB = static_cast<uint64_t>(tileS) * ROPE_ROW_UB + ROPE_FIXED_UB;
+    // 一行覆盖全部 group（32768 bf16 = 64 KiB），双缓冲与原 tileS=8 的峰值相同。
+    const uint64_t ropeUB = static_cast<uint64_t>(TILE_S_CAP) * ROPE_ROW_UB + ROPE_FIXED_UB;
     if (ropeUB > usableUB) {
         return ReportTilingFailure(context, "RoPE UB peak " + std::to_string(ropeUB) + " > usableUB " +
                                                  std::to_string(usableUB) +
                                                  " (tileS=" + std::to_string(tileS) + ")");
+    }
+
+    // ---- 4b. 设备内 ND→NZ 预转换开关（按 S 门控；小 S 保持 ND 路径，行为不变）----
+    const bool nzConv = (totalS >= NZ_CONV_MIN_S);
+    if (nzConv && (ropeUB + NZ_STAGE_UB > usableUB)) {
+        return ReportTilingFailure(context, "NZ convert UB peak " + std::to_string(ropeUB + NZ_STAGE_UB) +
+                                                 " > usableUB " + std::to_string(usableUB));
     }
 
     // ---- 5. GEMM1 分核（只切 N，权重只读一次）----
@@ -467,13 +478,15 @@ static ge::graphStatus TilingMlaEpilogue(gert::TilingContext* context)
         return ReportTilingFailure(context, "GEMM1 SetAType failed, rc=" + std::to_string(mm1SetATypeRc));
     }
     const int32_t mm1SetBTypeRc = mm1Tiling.SetBType(
-        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_BFLOAT16, false); // GEMM1：B 非转置
+        matmul_tiling::TPosition::GM,
+        nzConv ? matmul_tiling::CubeFormat::NZ : matmul_tiling::CubeFormat::ND,
+        matmul_tiling::DataType::DT_BFLOAT16, false); // GEMM1：B 非转置（nzConv 时为 NZ 副本）
     if (mm1SetBTypeRc != 0) {
         return ReportTilingFailure(context, "GEMM1 SetBType failed, rc=" + std::to_string(mm1SetBTypeRc));
     }
+    // c 内部布局改为 NZ：GEMM1 直接写 NZ，GEMM2 直接读 NZ，省掉 GEMM2 A 的 ND→NZ。
     const int32_t mm1SetCTypeRc = mm1Tiling.SetCType(
-        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::NZ,
         matmul_tiling::DataType::DT_BFLOAT16);
     if (mm1SetCTypeRc != 0) {
         return ReportTilingFailure(context, "GEMM1 SetCType failed, rc=" + std::to_string(mm1SetCTypeRc));
@@ -510,15 +523,17 @@ static ge::graphStatus TilingMlaEpilogue(gert::TilingContext* context)
     }
 
     matmul_tiling::MatmulApiTiling mm2Tiling(platform);
+    // c 是 GEMM1 的 NZ 输出，GEMM2 A 直接按 NZ 读取。
     const int32_t mm2SetATypeRc = mm2Tiling.SetAType(
-        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::NZ,
         matmul_tiling::DataType::DT_BFLOAT16, false);
     if (mm2SetATypeRc != 0) {
         return ReportTilingFailure(context, "GEMM2 SetAType failed, rc=" + std::to_string(mm2SetATypeRc));
     }
     const int32_t mm2SetBTypeRc = mm2Tiling.SetBType(
-        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_BFLOAT16, true); // GEMM2：B 转置（与 bTypeTrans / SetTensorB(true) 一致）
+        matmul_tiling::TPosition::GM,
+        nzConv ? matmul_tiling::CubeFormat::NZ : matmul_tiling::CubeFormat::ND,
+        matmul_tiling::DataType::DT_BFLOAT16, true); // GEMM2：B 转置（nzConv 时为 NZ 副本）
     if (mm2SetBTypeRc != 0) {
         return ReportTilingFailure(context, "GEMM2 SetBType failed, rc=" + std::to_string(mm2SetBTypeRc));
     }
@@ -638,7 +653,15 @@ static ge::graphStatus TilingMlaEpilogue(gert::TilingContext* context)
     const uint64_t cBytes =
         static_cast<uint64_t>(paddedM) * static_cast<uint64_t>(MLA_G) * static_cast<uint64_t>(MLA_N1) * 2ULL;
     const uint64_t cOffset = AlignUpU64(rBytes, WS_ALIGN);
-    const uint64_t userWorkspaceSize = cOffset + AlignUpU64(cBytes, WS_ALIGN);
+    // nzConv 时追加 w1/w2 的 NZ 副本（各与 ND 原权重同字节数）
+    const uint64_t w1NzBytes =
+        nzConv ? static_cast<uint64_t>(MLA_G) * static_cast<uint64_t>(MLA_K1) * static_cast<uint64_t>(MLA_N1) * 2ULL
+               : 0ULL;
+    const uint64_t w2NzBytes =
+        nzConv ? static_cast<uint64_t>(MLA_K2) * static_cast<uint64_t>(MLA_N2) * 2ULL : 0ULL;
+    const uint64_t w1NzOffset = cOffset + AlignUpU64(cBytes, WS_ALIGN);
+    const uint64_t w2NzOffset = w1NzOffset + AlignUpU64(w1NzBytes, WS_ALIGN);
+    const uint64_t userWorkspaceSize = w2NzOffset + AlignUpU64(w2NzBytes, WS_ALIGN);
     const uint32_t sysWorkspaceSize = platform.GetLibApiWorkSpaceSize();
     if (sysWorkspaceSize == UINT32_MAX) {
         return ReportTilingFailure(context, "GetLibApiWorkSpaceSize() returned UINT32_MAX");
@@ -678,14 +701,19 @@ static ge::graphStatus TilingMlaEpilogue(gert::TilingContext* context)
     tiling->rOffset = 0ULL;
     tiling->cOffset = cOffset;
     tiling->userWorkspaceSize = userWorkspaceSize;
+    tiling->nzConv = nzConv ? 1U : 0U;
+    tiling->nzPad = 0U;
+    tiling->w1NzOffset = w1NzOffset;
+    tiling->w2NzOffset = w2NzOffset;
 
     // ---- 11. P1/P2/P4/P6/P7 取证日志（首个样例据此核对）----
     OP_LOGI(context,
             "tiling: S=%u paddedM=%u padRows=%u aicNum=%u aivNum=%u ubSize=%lu usableUB=%lu "
-            "sysWs=%u userWs=%lu totalWs=%lu",
+            "sysWs=%u userWs=%lu totalWs=%lu nzConv=%u",
             totalS, paddedM, padRows, aicNum, aivNum, static_cast<unsigned long>(ubSize),
             static_cast<unsigned long>(usableUB), sysWorkspaceSize, static_cast<unsigned long>(userWorkspaceSize),
-            static_cast<unsigned long>(userWorkspaceSize + static_cast<uint64_t>(sysWorkspaceSize)));
+            static_cast<unsigned long>(userWorkspaceSize + static_cast<uint64_t>(sysWorkspaceSize)),
+            static_cast<unsigned>(nzConv ? 1U : 0U));
     OP_LOGI(context,
             "RoPE: tileS=%u pipeTileNum=%u pipeTileRows=%u sTileNum=%u ropeTaskNum=%u "
             "ropeTasksPerCore=%u aivUsedCores=%u ropeUB=%lu (fixedUB=%lu rowUB=%lu)",

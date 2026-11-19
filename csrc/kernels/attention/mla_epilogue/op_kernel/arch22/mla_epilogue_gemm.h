@@ -39,6 +39,11 @@ using aType = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t>;
 using bType = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t>;         // ISTRANS=false：GEMM1 非转置
 using bTypeTrans = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t, true>; // ISTRANS=true：GEMM2 B 转置
 using cType = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t>;
+using aTypeNz = MatmulType<TPosition::GM, CubeFormat::NZ, bfloat16_t>;   // GEMM2 A（内部 c，NZ）
+using cTypeNz = MatmulType<TPosition::GM, CubeFormat::NZ, bfloat16_t>;   // GEMM1 C（内部 c，NZ）
+// nzConv（大 S 门控）：w1/w2 由 kernel 内 AIV 预转换成 NZ 后使用（不改接口）
+using bTypeNz = MatmulType<TPosition::GM, CubeFormat::NZ, bfloat16_t>;          // GEMM1 B 非转置 NZ
+using bTypeTransNz = MatmulType<TPosition::GM, CubeFormat::NZ, bfloat16_t, true>; // GEMM2 B 转置 NZ
 using biasType = MatmulType<TPosition::GM, CubeFormat::ND, float>;
 
 /**
@@ -58,8 +63,18 @@ public:
         w2Gm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(w2));
         yGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(y));
 
+        // nzConv 时 B 指向 workspace 内的 NZ 副本（由 AIV 在 GEMM1 前/GEMM1 期间转换）
+        nz_ = (td.nzConv != 0U);
+        w1NzGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(userWs + td.w1NzOffset));
+        w2NzGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(userWs + td.w2NzOffset));
+
         // 系统 workspace 交给框架；必须在任何 InitBuffer 之前（DESIGN §3.4 第 7 步）
-        REGIST_MATMUL_OBJ(pipe, GetSysWorkSpacePtr(), mm1_, &td.gemm1Tiling, mm2_, &td.gemm2Tiling);
+        // 两套 Matmul 实例按运行期开关二选一 Init：NORM(ND) 与 NZ 各一套，避免运行期切换 B 格式。
+        if (nz_) {
+            REGIST_MATMUL_OBJ(pipe, GetSysWorkSpacePtr(), mm1Nz_, &td.gemm1Tiling, mm2Nz_, &td.gemm2Tiling);
+        } else {
+            REGIST_MATMUL_OBJ(pipe, GetSysWorkSpacePtr(), mm1_, &td.gemm1Tiling, mm2_, &td.gemm2Tiling);
+        }
     }
 
     /**
@@ -67,6 +82,16 @@ public:
      *        纯计算体，不含 SyncAll（屏障由入口公共控制流给出）。
      */
     __aicore__ inline void Gemm1Tile(uint32_t t, const MlaEpilogueTilingData& td)
+    {
+        if (nz_) {
+            Gemm1TileImpl(mm1Nz_, t, td);
+        } else {
+            Gemm1TileImpl(mm1_, t, td);
+        }
+    }
+
+    template <typename MM>
+    __aicore__ inline void Gemm1TileImpl(MM& mm1, uint32_t t, const MlaEpilogueTilingData& td)
     {
         const uint32_t coreIdx = static_cast<uint32_t>(GetBlockIdx());
         if (coreIdx >= td.gemm1UsedCores) {
@@ -91,18 +116,23 @@ public:
 
         // 5 参 SetOrgShape：orgKc = MLA_G * N1 = 8192 为 C（c 的 [paddedM, 8192]）行跨度，
         // 与 B 的 orgN（N1 = 1024）不同；必须在 SetTensorA/SetTensorB/SetSingleShape 之前调用（P4）
-        mm1_.SetOrgShape(static_cast<int32_t>(td.paddedM), static_cast<int32_t>(MLA_N1), static_cast<int32_t>(MLA_K1),
-                         static_cast<int32_t>(MLA_K1), static_cast<int32_t>(MLA_G * MLA_N1));
+        mm1.SetOrgShape(static_cast<int32_t>(td.paddedM), static_cast<int32_t>(MLA_N1), static_cast<int32_t>(MLA_K1),
+                        static_cast<int32_t>(MLA_K1), static_cast<int32_t>(MLA_G * MLA_N1));
         // r 布局 [8, paddedM, 4096]，第 t 段从行 m0 起，行跨度仍为 K1
-        mm1_.SetTensorA(rGm_[static_cast<uint64_t>(g) * td.paddedM * MLA_K1 + static_cast<uint64_t>(m0) * MLA_K1],
-                        false);
-        // w1[g] 为 [K1, N1]，本核列块起点 n0；bType 为 ISTRANS=false → 运行期只能传 false
-        mm1_.SetTensorB(w1Gm_[static_cast<uint64_t>(g) * MLA_K1 * MLA_N1 + n0], false);
+        mm1.SetTensorA(rGm_[static_cast<uint64_t>(g) * td.paddedM * MLA_K1 + static_cast<uint64_t>(m0) * MLA_K1],
+                       false);
+        // w1[g]：ND 时 [K1, N1] 取 n0；NZ 时 [N1/16][K1][16] 取 n0*K1
+        const uint64_t bOff = static_cast<uint64_t>(g) * MLA_K1 * MLA_N1 +
+                              (nz_ ? static_cast<uint64_t>(n0) * MLA_K1 : static_cast<uint64_t>(n0));
+        mm1.SetTensorB(nz_ ? w1NzGm_[bOff] : w1Gm_[bOff], false);
         // 覆盖内建单核形状：M 为本段行数（末段可小），N 为本核列块（320/320/384，128 B 对齐）
-        mm1_.SetSingleShape(static_cast<int32_t>(curM), static_cast<int32_t>(curN), static_cast<int32_t>(MLA_K1));
-        // c 布局 [paddedM, 8192]（行内 [g, m] 排布）；每行只写本核的 N 列块
-        mm1_.IterateAll(cGm_[static_cast<uint64_t>(m0) * (MLA_G * MLA_N1) + static_cast<uint64_t>(g) * MLA_N1 + n0],
-                        0, false);
+        mm1.SetSingleShape(static_cast<int32_t>(curM), static_cast<int32_t>(curN), static_cast<int32_t>(MLA_K1));
+        // c 布局改为 NZ：[G*N1/16][paddedM/16][16][16]；本核（nIdx 0/1 的 320/384 列）
+        // 是 g 对应 batch 块内从 n0 开始的连续 N 切片。当前 pipeTileNum=1、m0=0，
+        // 每个 core 的 C 块覆盖完整 paddedM 行，因此偏移 = g*N1*paddedM + n0*paddedM。
+        const uint64_t cNzOff = static_cast<uint64_t>(g) * MLA_N1 * td.paddedM +
+                                static_cast<uint64_t>(n0) * td.paddedM;
+        mm1.IterateAll(cGm_[cNzOff], 0, false);
     }
 
     /**
@@ -110,6 +140,16 @@ public:
      *        纯计算体，不含 SyncAll。
      */
     __aicore__ inline void Gemm2(const MlaEpilogueTilingData& td)
+    {
+        if (nz_) {
+            Gemm2Impl(mm2Nz_, td);
+        } else {
+            Gemm2Impl(mm2_, td);
+        }
+    }
+
+    template <typename MM>
+    __aicore__ inline void Gemm2Impl(MM& mm2, const MlaEpilogueTilingData& td)
     {
         const uint32_t coreIdx = static_cast<uint32_t>(GetBlockIdx());
         if (coreIdx >= td.gemm2UsedCores) {
@@ -121,14 +161,16 @@ public:
                                            ((coreIdx < td.gemm2NUnitsRem) ? coreIdx : td.gemm2NUnitsRem));
         const uint32_t curN = MLA_ALIGN16 * nUnits;
 
-        // 3 参重载：orgKa = orgKb = orgKc = K2；B 的 N 与 C 的 N 同为 N2 = 5120
-        mm2_.SetOrgShape(static_cast<int32_t>(td.totalS), static_cast<int32_t>(MLA_N2), static_cast<int32_t>(MLA_K2));
-        mm2_.SetTensorA(cGm_[0], false); // c 即 c_flat[S, 8192]，K 维连续
-        // w2 按 B 转置使用（存储 [N2, K2]），bTypeTrans 为 ISTRANS=true → 运行期传 true（P6）
-        mm2_.SetTensorB(w2Gm_[static_cast<uint64_t>(n0) * MLA_K2], true);
-        mm2_.SetSingleShape(static_cast<int32_t>(td.totalS), static_cast<int32_t>(curN),
-                            static_cast<int32_t>(MLA_K2));
-        mm2_.IterateAll(yGm_[n0], 0, false); // 直接写 y[S,5120]，消除 TensorMove
+        // A 是 NZ 的 c：orgM 必须用 paddedM（c 的 M 方向按 paddedM 排），
+        // 计算 M 仍由 SetSingleShape(totalS, ...) 指定；否则 S 非 16 对齐时 A 的 NZ stride 会错位。
+        mm2.SetOrgShape(static_cast<int32_t>(td.paddedM), static_cast<int32_t>(MLA_N2), static_cast<int32_t>(MLA_K2));
+        mm2.SetTensorA(cGm_[0], false); // c 即 c_flat[S, 8192]，K 维连续
+        // w2 按 B 转置使用（存储 [N2, K2]）：ND 取 n0*K2；NZ 布局 [K2/16][N2][16] 取 n0*16
+        const uint64_t bOff = nz_ ? (static_cast<uint64_t>(n0) * 16U) : (static_cast<uint64_t>(n0) * MLA_K2);
+        mm2.SetTensorB(nz_ ? w2NzGm_[bOff] : w2Gm_[bOff], true);
+        mm2.SetSingleShape(static_cast<int32_t>(td.totalS), static_cast<int32_t>(curN),
+                           static_cast<int32_t>(MLA_K2));
+        mm2.IterateAll(yGm_[n0], 0, false); // 直接写 y[S,5120]，消除 TensorMove
     }
 
     /**
@@ -146,7 +188,11 @@ public:
      */
     __aicore__ inline void CloseGemm1()
     {
-        mm1_.End();
+        if (nz_) {
+            mm1Nz_.End();
+        } else {
+            mm1_.End();
+        }
         AscendC::SetMMRowMajor();
     }
 
@@ -156,14 +202,20 @@ private:
     // B: baseN × stepKb×baseK），把 GM→L1 的 MTE2 指令数降为约 1/4~1/8，
     // 单条搬运粒度从 ~16/25 KiB 提升到 ~80~90 KiB（对齐库 kernel 的 51~110 KiB）。
     // baseM/baseN/baseK 不变 → L0 累加顺序不变，结果与 Norm 逐位一致。
-    Matmul<aType, bType, cType, biasType, CFG_MDL> mm1_;      // GEMM1：B 非转置
+    Matmul<aType, bType, cTypeNz, biasType, CFG_MDL> mm1_;    // GEMM1：B 非转置，C 为 NZ
 
-    Matmul<aType, bTypeTrans, cType, biasType, CFG_MDL> mm2_; // GEMM2：B 转置
+    Matmul<aTypeNz, bTypeTrans, cType, biasType, CFG_MDL> mm2_; // GEMM2：A/c 为 NZ，B 转置
+    // nzConv 专用实例（运行期二选一 Init，另一套不分配）
+    Matmul<aType, bTypeNz, cTypeNz, biasType, CFG_MDL> mm1Nz_;          // GEMM1：C 为 NZ，B 为 NZ
+    Matmul<aTypeNz, bTypeTransNz, cType, biasType, CFG_MDL> mm2Nz_;     // GEMM2：A/c 为 NZ，B 转置 NZ
+    bool nz_ = false;
 
     GlobalTensor<bfloat16_t> rGm_;  // [8, paddedM, 4096]
-    GlobalTensor<bfloat16_t> cGm_;  // [paddedM, 8192]
+    GlobalTensor<bfloat16_t> cGm_;  // NZ: [8192/16][paddedM/16][16][16]
     GlobalTensor<bfloat16_t> w1Gm_; // [8, 4096, 1024]
     GlobalTensor<bfloat16_t> w2Gm_; // [5120, 8192]
+    GlobalTensor<bfloat16_t> w1NzGm_; // [8][N1/16][K1][16]（workspace）
+    GlobalTensor<bfloat16_t> w2NzGm_; // [K2/16][N2][16]（workspace）
     GlobalTensor<bfloat16_t> yGm_;  // [S, 5120]
 };
 

@@ -57,8 +57,8 @@ public:
         sinGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(sin));
         rGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(userWs + td.rOffset));
 
-        // x 行数据缓冲：每 tile tileS 行 × 4096 bf16，双缓冲（UB 口径 tileS × 16384 B）
-        pipe->InitBuffer(xQue_, 2, td.tileS * MLA_X_GROUP * static_cast<uint32_t>(sizeof(bfloat16_t)));
+        // 一整行覆盖全部 group：32768 bf16 = 64 KiB，双缓冲峰值与原 tileS=8 一致。
+        pipe->InitBuffer(xQue_, 2, MLA_X_ROW * static_cast<uint32_t>(sizeof(bfloat16_t)));
         pipe->InitBuffer(cosQue_, 2, MLA_ROPE_D * static_cast<uint32_t>(sizeof(float)));
         pipe->InitBuffer(sinQue_, 2, MLA_ROPE_D * static_cast<uint32_t>(sizeof(float)));
         pipe->InitBuffer(ropeBuf_, MLA_ROPE_F32_NUM * static_cast<uint32_t>(sizeof(float)));
@@ -80,7 +80,8 @@ public:
 
     /**
      * @brief 处理第 t 个流水段（行区间 [t*pipeTileRows, ...)）
-     *        任务空间：MLA_G × sTileNum 个 (g, sTile) 任务，按核号条带分配；
+     *        任务空间：pipeTileRows 个行任务；每行一次处理全部 8 个 group，
+     *        cos/sin 每行只加载一次，按核号连续分配；
      *        末段额外清零 r 的填充行 [totalS, paddedM)（必须在屏障前完成）。
      *        纯计算体，不含 SyncAll。
      */
@@ -96,15 +97,10 @@ public:
         const uint32_t taskEnd = (taskEndBase < td.ropeTaskNum) ? taskEndBase : td.ropeTaskNum;
 
         for (uint32_t taskIdx = taskBegin; taskIdx < taskEnd; ++taskIdx) {
-            const uint32_t g = taskIdx / td.sTileNum;
-            const uint32_t sTile = taskIdx - g * td.sTileNum;
-            const uint32_t s0 = m0 + sTile * td.tileS;
-            uint32_t curRows = 0U;
-            if (s0 < td.totalS) {
-                const uint32_t left = td.totalS - s0;
-                curRows = (td.tileS < left) ? td.tileS : left;
+            const uint32_t row = m0 + taskIdx;
+            if (row < td.totalS) {
+                ProcessRow(row, td);
             }
-            ProcessTask(g, s0, curRows, td);
         }
 
         if (((t + 1U) == td.pipeTileNum) && (td.padRows != 0U)) {
@@ -114,13 +110,10 @@ public:
 
 private:
     /**
-     * @brief 单个 (g, sTile) 任务：加载行 → RoPE 就地改写 → 写回 r[g]
+     * @brief 单个行任务：整行加载一次，cos/sin 复用到全部 8 个 group，再分别写回 r[g]。
      */
-    __aicore__ inline void ProcessTask(uint32_t g, uint32_t s0, uint32_t curRows, const MlaEpilogueTilingData& td)
+    __aicore__ inline void ProcessRow(uint32_t row, const MlaEpilogueTilingData& td)
     {
-        if (curRows == 0U) {
-            return;
-        }
         LocalTensor<float> rope = ropeBuf_.Get<float>();
         LocalTensor<float> swp = swapBuf_.Get<float>();
         LocalTensor<float> sinSigned = sinSignedBuf_.Get<float>();
@@ -128,30 +121,27 @@ private:
         LocalTensor<uint32_t> off = offBuf_.Get<uint32_t>();
 
         LocalTensor<bfloat16_t> xTile = xQue_.AllocTensor<bfloat16_t>();
-        for (uint32_t r = 0U; r < curRows; ++r) {
-            const uint64_t srcOff =
-                static_cast<uint64_t>(s0 + r) * MLA_X_ROW + static_cast<uint64_t>(g) * MLA_X_GROUP;
-            DataCopy(xTile[static_cast<uint64_t>(r) * MLA_X_GROUP], xGm_[srcOff], MLA_X_GROUP);
-        }
+        DataCopy(xTile, xGm_[static_cast<uint64_t>(row) * MLA_X_ROW], MLA_X_ROW);
         xQue_.EnQue(xTile); // MTE2 → V
         xTile = xQue_.DeQue<bfloat16_t>();
 
-        for (uint32_t r = 0U; r < curRows; ++r) {
-            LocalTensor<float> cosV = cosQue_.AllocTensor<float>();
-            LocalTensor<float> sinV = sinQue_.AllocTensor<float>();
-            const uint64_t csOff = static_cast<uint64_t>(s0 + r) * MLA_ROPE_D;
-            DataCopy(cosV, cosGm_[csOff], MLA_ROPE_D);
-            DataCopy(sinV, sinGm_[csOff], MLA_ROPE_D);
-            cosQue_.EnQue(cosV);
-            sinQue_.EnQue(sinV);
-            cosV = cosQue_.DeQue<float>();
-            sinV = sinQue_.DeQue<float>();
+        LocalTensor<float> cosV = cosQue_.AllocTensor<float>();
+        LocalTensor<float> sinV = sinQue_.AllocTensor<float>();
+        const uint64_t csOff = static_cast<uint64_t>(row) * MLA_ROPE_D;
+        DataCopy(cosV, cosGm_[csOff], MLA_ROPE_D);
+        DataCopy(sinV, sinGm_[csOff], MLA_ROPE_D);
+        cosQue_.EnQue(cosV);
+        sinQue_.EnQue(sinV);
+        cosV = cosQue_.DeQue<float>();
+        sinV = sinQue_.DeQue<float>();
 
-            // sinSigned[d] = sin[d] * (-1)^d
-            Mul(sinSigned, sinV, sign, MLA_ROPE_D, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+        // sinSigned[d] = sin[d] * (-1)^d；同一行内被全部 group 复用。
+        Mul(sinSigned, sinV, sign, MLA_ROPE_D, 1, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+        for (uint32_t g = 0U; g < MLA_G; ++g) {
+            const uint64_t groupOff = static_cast<uint64_t>(g) * MLA_X_GROUP;
             // bf16 → f32（每 head 64 维，共 8 段，段间源跨距 512 元素）
             for (uint32_t h = 0U; h < MLA_ROPE_HEADS; ++h) {
-                Cast(rope[h * MLA_ROPE_D], xTile[static_cast<uint64_t>(r) * MLA_X_GROUP + h * 512U + MLA_ROPE_OFF],
+                Cast(rope[h * MLA_ROPE_D], xTile[groupOff + h * 512U + MLA_ROPE_OFF],
                      RoundMode::CAST_NONE, MLA_ROPE_D);
             }
             // swap[h][d] = rope[h][d^1]（srcOffset 单位为字节）
@@ -164,18 +154,19 @@ private:
             Add(rope, rope, swp, MLA_ROPE_D, MLA_ROPE_HEADS, BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             // f32 → bf16（CAST_RINT：与 GEMM 输出的 BF16 舍入口径一致）
             for (uint32_t h = 0U; h < MLA_ROPE_HEADS; ++h) {
-                Cast(xTile[static_cast<uint64_t>(r) * MLA_X_GROUP + h * 512U + MLA_ROPE_OFF], rope[h * MLA_ROPE_D],
+                Cast(xTile[groupOff + h * 512U + MLA_ROPE_OFF], rope[h * MLA_ROPE_D],
                      RoundMode::CAST_RINT, MLA_ROPE_D);
             }
-
-            cosQue_.FreeTensor(cosV);
-            sinQue_.FreeTensor(sinV);
         }
 
+        cosQue_.FreeTensor(cosV);
+        sinQue_.FreeTensor(sinV);
         PipeBarrier<PIPE_ALL>(); // V 完成后再发起 MTE3
-        DataCopy(rGm_[static_cast<uint64_t>(g) * td.paddedM * MLA_X_GROUP +
-                      static_cast<uint64_t>(s0) * MLA_X_GROUP],
-                 xTile, curRows * MLA_X_GROUP);
+        for (uint32_t g = 0U; g < MLA_G; ++g) {
+            DataCopy(rGm_[static_cast<uint64_t>(g) * td.paddedM * MLA_X_GROUP +
+                          static_cast<uint64_t>(row) * MLA_X_GROUP],
+                     xTile[static_cast<uint64_t>(g) * MLA_X_GROUP], MLA_X_GROUP);
+        }
         PipeBarrier<PIPE_ALL>(); // MTE3 完成后再归还缓冲
         xQue_.FreeTensor(xTile);
     }

@@ -36,6 +36,7 @@
 #include "arch22/mla_epilogue_tiling_key.h"
 #include "arch22/mla_epilogue_gemm.h"
 #include "arch22/mla_epilogue_rope.h"
+#include "arch22/mla_epilogue_nzconv.h"
 
 using namespace AscendC;
 
@@ -65,19 +66,26 @@ __global__ __aicore__ void fi_mla_epilogue(GM_ADDR x, GM_ADDR cos, GM_ADDR sin, 
 
         NsMlaEpilogue::AicContext aic;  // AIC 侧计算上下文：AIV 侧只构造、不调用
         NsMlaEpilogue::RopeContext rope; // AIV 侧计算上下文：AIC 侧只构造、不调用
+        NsMlaEpilogue::NzConvContext nzconv; // AIV 侧：大 S 时把 w1/w2 预转成 NZ（nzConv=1）
 
         if ASCEND_IS_AIC {
             aic.Init(tilingData, &pipe, userWs, w1, w2, y); // REGIST_MATMUL_OBJ 早于本 pipe 的任何 InitBuffer
         }
         if ASCEND_IS_AIV {
             rope.Init(tilingData, &pipe, userWs, x, cos, sin);
+            if (tilingData.nzConv != 0U) {
+                nzconv.Init(tilingData, &pipe, userWs, w1, w2);
+            }
         }
 
         // ===== 公共控制流：AIC/AIV 执行同一份屏障序列，计算体按 ASCEND_IS_AIC/AIV 隔离 =====
         if ASCEND_IS_AIV {
             rope.Tile(0U, tilingData); // 前导段：只做第 0 段 RoPE
+            if (tilingData.nzConv != 0U) {
+                nzconv.ConvW1(tilingData); // w1 NZ 必须在 GEMM1 之前就绪（与 RoPE 串行，同在 AIV）
+            }
         }
-        SyncAll<false>(); // B0：r 第 0 段就绪
+        SyncAll<false>(); // B0：r 第 0 段（nzConv 时还有 w1 NZ）就绪
 
         for (uint32_t t = 0U; t < tilingData.pipeTileNum; ++t) {
             if ASCEND_IS_AIC {
@@ -86,9 +94,11 @@ __global__ __aicore__ void fi_mla_epilogue(GM_ADDR x, GM_ADDR cos, GM_ADDR sin, 
             if ASCEND_IS_AIV {
                 if ((t + 1U) < tilingData.pipeTileNum) {
                     rope.Tile(t + 1U, tilingData); // 与 Gemm1Tile(t) 并发：RoPE(t+1) ∥ GEMM1(t)
+                } else if (tilingData.nzConv != 0U) {
+                    nzconv.ConvW2(tilingData); // w2 NZ 只需在 GEMM2 前就绪：藏在 GEMM1 最后一段
                 }
             }
-            SyncAll<false>(); // B(t+1)：Gemm1Tile(t) 与 RopeTile(t+1) 均完成
+            SyncAll<false>(); // B(t+1)：Gemm1Tile(t) 与 RopeTile(t+1)（或 w2 转换）均完成
         }
 
         if ASCEND_IS_AIC {

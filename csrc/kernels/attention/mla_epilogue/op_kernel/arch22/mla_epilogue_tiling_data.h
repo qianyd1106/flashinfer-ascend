@@ -63,7 +63,11 @@ struct MlaEpilogueTilingData {
     uint32_t reserved;                // 8 字节对齐占位
     uint64_t rOffset;                 // r 相对用户 workspace 起点的字节偏移（=0）
     uint64_t cOffset;                 // c 相对用户 workspace 起点的字节偏移
-    uint64_t userWorkspaceSize;       // r 区 + c 区（含对齐余量）
+    uint64_t userWorkspaceSize;       // r 区 + c 区 +（nzConv 时）w1NZ/w2NZ 区（含对齐余量）
+    uint32_t nzConv;                  // 1 = kernel 内把 w1/w2 转为 NZ 后供 GEMM 使用（按 S 门控）
+    uint32_t nzPad;                   // 8 字节对齐占位
+    uint64_t w1NzOffset;              // w1 NZ 副本相对用户 workspace 起点的字节偏移
+    uint64_t w2NzOffset;              // w2 NZ 副本相对用户 workspace 起点的字节偏移
 };
 #pragma pack(pop)
 

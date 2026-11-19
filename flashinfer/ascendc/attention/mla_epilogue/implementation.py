@@ -46,8 +46,8 @@ IMPLEMENTATIONS = AscendCImplementation.for_targets(
         ),
     ),
     runner_factory=make_runner,
-    # align16(131072) * (8*4096*2 + 8192*2) + 16 MiB system workspace.
-    workspace_bound=10754195968,
+    # Max workspace includes r/c, system workspace, and the S>=8192 w1/w2 NZ copies.
+    workspace_bound=10905190912,
 )
 IMPLEMENTATION = IMPLEMENTATIONS[0]
 NATIVE = IMPLEMENTATION.native
