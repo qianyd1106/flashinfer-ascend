@@ -1,7 +1,7 @@
 """Atlas A3 Ascend C implementation of attention.mla_epilogue."""
 
 from flashinfer.ascendc.definition import AscendCImplementation, BuildConfig, NativeBinding
-from flashinfer.jit.recipe import ShapeConstraint, TensorParameter
+from flashinfer.jit.recipe import BuildDependency, CATLASS_REVISION, ShapeConstraint, TensorParameter
 from flashinfer.operators.author_api import Support
 from flashinfer.operators.attention.mla_epilogue.operator import OPERATOR
 from flashinfer.runtime import CapabilityCase
@@ -29,6 +29,9 @@ IMPLEMENTATIONS = AscendCImplementation.for_targets(
         op_type="FiMlaEpilogue",
         tiling="TilingMlaEpilogue",
         cmake="CMakeLists.txt",
+        implementation="catlass",
+        dependencies=(BuildDependency(name="catlass", revision=CATLASS_REVISION),),
+        definitions=("CATLASS_ARCH=2201",),
         device_entry="fi_mla_epilogue",
     ),
     binding=NativeBinding(
@@ -46,8 +49,8 @@ IMPLEMENTATIONS = AscendCImplementation.for_targets(
         ),
     ),
     runner_factory=make_runner,
-    # Max workspace includes r/c, system workspace, and the S>=8192 w1/w2 NZ copies.
-    workspace_bound=10905190912,
+    # Max workspace: r/c + system workspace; w1/w2 are read as ND, no NZ copies.
+    workspace_bound=10754195968,
 )
 IMPLEMENTATION = IMPLEMENTATIONS[0]
 NATIVE = IMPLEMENTATION.native

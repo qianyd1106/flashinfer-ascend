@@ -12,14 +12,6 @@
  * \file mla_epilogue_tiling.cpp
  * \brief mla_epilogue Host 侧 Tiling 实现（arch22 / DAV_2201，DESIGN §3.4）
  *
- * 方案要点（严格按 DESIGN §3.4）：
- *  - 所有平台能力（核数 / UB 容量 / 系统 workspace）运行时获取，禁止写死 24 / 48 / 192 KB；
- *  - 单核 matmul_tiling::MatmulApiTiling 生成两套 TCubeTiling，N 分核与尾块由 Host 手工推导，
- *    Kernel 侧以 SetSingleShape + 偏移指针下发；不复写 usedCoreNum（P7）；
- *  - GEMM1：B 非转置（Host SetBType isTrans=false），GEMM2：B 转置（isTrans=true），
- *    与 Kernel 的 MatmulType ISTRANS、运行时 SetTensorB 三处一致（P6）；
- *  - Matmul 片上临时空间用 MatmulGetTmpBufSizeV2 实测（M-10 口径），不用 shareUbSize 预留字段；
- *  - 系统 workspace 用 GetLibApiWorkSpaceSize()，与 Kernel 的 GetSysWorkSpacePtr() 配套（P1）。
  */
 
 #include <string>
@@ -42,9 +34,6 @@ constexpr size_t WORKSPACE_NUM = 1U;
 constexpr uint64_t UB_RESERVED_SIZE = 8192ULL;      // 框架预留
 constexpr uint64_t ROPE_ROW_UB = 16384ULL;          // 每行双缓冲 xTile：2 × 4096 × 2 B
 constexpr uint64_t ROPE_FIXED_UB = 5888ULL;         // ropeF32 + swapF32 + cos/sin 双缓冲 + 3 个辅助向量
-// 设备内 ND→NZ 预转换（大 S 门控）：AIV 用 UB 暂存按 32 B 块做跨行搬运。
-constexpr uint32_t NZ_CONV_MIN_S = 8192U;           // 只有 S >= 该值才做转换（转换成本 ~468us）
-constexpr uint64_t NZ_STAGE_UB = 32768ULL;          // 2 × 16 KiB 双缓冲暂存（v1）
 constexpr uint32_t TILE_S_CAP = 8U;                 // 设计余量封顶
 constexpr uint32_t WS_ALIGN = 512U;
 
@@ -265,52 +254,6 @@ static ge::graphStatus CheckInputShapes(gert::TilingContext* context, uint32_t& 
 
 
 // =============================================================================
-// MDL 大块搬运调度参数（性能优化 r2）
-// =============================================================================
-// Matmul 走 CFG_MDL 调度时，每个外层迭代按 stepKa/stepKb 个 baseK 块一次性搬 A/B：
-//   A tile = baseM × (stepKa×baseK)，B tile = baseN × (stepKb×baseK)。
-// 库默认（GEMM1 stepKa=16/stepKb=1，GEMM2 stepKa=2/stepKb=8）在本算子的 N 手工分核 +
-// 单 baseN tile 场景下，GEMM1 的 B 搬运粒度过小（256×1×64×2 = 32 KiB/条），MTE2 指令数
-// 偏高（S=96 实测全核 3,264 条，平均 31 KiB/条）。把 stepKb 提高到 2（GEMM1）/ 4
-// （GEMM2，等价更大的 B tile），并把 depthA1/depthB1 按 2×stepK 重新配套（保持双缓冲），
-// 单条 GM→L1 搬运粒度提升到 64 KiB / 114 KiB，MTE2 指令数减半，S=96 op-level 由
-// 181.0 us 降到 ~169 us（21 会话同协议）。
-// 约束（与库的校验规则一致）：
-//   kIter = K / baseK 必须能被 stepKa/stepKb 整除；
-//   stepN=1（kIter > stepKb 恒成立）时 depthB1 % stepKb == 0 且 ratio ≤ 2；
-//   stepM=1 时 depthA1 % stepKa == 0 且 ratio ≤ 2；
-//   A+B 的 L1 双缓冲占用 ≤ L1 容量（否则保留库 tiling，避免越界）。
-static bool ApplyMdlStepTiling(AscendC::tiling::TCubeTiling& t, int32_t stepKa, int32_t stepKb,
-                              uint64_t l1Size)
-{
-    if (t.baseM <= 0 || t.baseN <= 0 || t.baseK <= 0 || t.Ka <= 0) {
-        return false;
-    }
-    const int32_t kIter = t.Ka / t.baseK;
-    if (kIter <= 0 || (kIter % stepKa) != 0 || (kIter % stepKb) != 0) {
-        return false;
-    }
-    if (t.stepM > 1 || t.stepN > 1) {
-        return false; // 本算子两段 GEMM 恒为 stepM=stepN=1；其他形态不接管
-    }
-    const int32_t depthA = 2 * stepKa;
-    const int32_t depthB = 2 * stepKb;
-    const uint64_t needA = static_cast<uint64_t>(depthA) * static_cast<uint64_t>(t.baseM) *
-                           static_cast<uint64_t>(t.baseK) * 2ULL;
-    const uint64_t needB = static_cast<uint64_t>(depthB) * static_cast<uint64_t>(t.baseN) *
-                           static_cast<uint64_t>(t.baseK) * 2ULL;
-    const uint64_t margin = 16ULL * 1024ULL; // 预留余量，避免与库内部其他占用相撞
-    if (needA + needB + margin > l1Size) {
-        return false;
-    }
-    t.stepKa = stepKa;
-    t.depthA1 = depthA;
-    t.stepKb = stepKb;
-    t.depthB1 = depthB;
-    return true;
-}
-
-// =============================================================================
 // Tiling 主体
 // =============================================================================
 
@@ -403,13 +346,6 @@ static ge::graphStatus TilingMlaEpilogue(gert::TilingContext* context)
                                                  " (tileS=" + std::to_string(tileS) + ")");
     }
 
-    // ---- 4b. 设备内 ND→NZ 预转换开关（按 S 门控；小 S 保持 ND 路径，行为不变）----
-    const bool nzConv = (totalS >= NZ_CONV_MIN_S);
-    if (nzConv && (ropeUB + NZ_STAGE_UB > usableUB)) {
-        return ReportTilingFailure(context, "NZ convert UB peak " + std::to_string(ropeUB + NZ_STAGE_UB) +
-                                                 " > usableUB " + std::to_string(usableUB));
-    }
-
     // ---- 5. GEMM1 分核（只切 N，权重只读一次）----
     uint32_t nSplit = aicNum / MLA_G;
     if (nSplit < 1U) {
@@ -452,216 +388,14 @@ static ge::graphStatus TilingMlaEpilogue(gert::TilingContext* context)
                                                  " > N units " + std::to_string(n2Units));
     }
 
-    // GEMM2 的 B 按转置使用（存储 [N2, K2]），每个 K 行的连续长度只有 baseK × 2 B。
-    // r2 优化（MDL 大块搬运）：baseN 取满单核 N 块（24 核 → 224），使每核 N 只落在 1 个
-    // baseN tile 内 —— MDL 下每个 N tile 都要把 A 片沿 K 重扫一遍，N tile 数 2→1 直接把
-    // GEMM2 的 A（c 片）GM→L1 请求量减半，MTE2 指令数随之减半。
-    // baseK 取 64：库在保持 L0B 双缓冲（224×64×2×2 B = 57,344 ≤ 64 KB）下能容纳的最大值；
-    // 请求 baseK=128 时 L0B 双缓冲需 114,688 > 64 KB，库会静默回落单缓冲/降 baseK，故显式取 64。
-    // L0C：baseM × baseN × 4 B = 96×224×4 = 86,016 ≤ 128 KB。
-    const uint32_t gemm2BaseK = 64U;
-    uint32_t gemm2BaseN = (gemm2SingleNMax / MLA_ALIGN16) * MLA_ALIGN16;
-    // L0B 双缓冲上限：baseN × baseK × 2 B × 2 ≤ 64 KB → baseK=64 时 baseN ≤ 256
-    if (gemm2BaseN > 256U) {
-        gemm2BaseN = 256U;
-    }
-    if (gemm2BaseN < 4U * MLA_ALIGN16) {
-        gemm2BaseN = 4U * MLA_ALIGN16;
-    }
-
-    // ---- 7. 两套 TCubeTiling（单核 MatmulApiTiling + Host 手工分核）----
-    matmul_tiling::MatmulApiTiling mm1Tiling(platform);
-    const int32_t mm1SetATypeRc = mm1Tiling.SetAType(
-        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_BFLOAT16, false);
-    if (mm1SetATypeRc != 0) {
-        return ReportTilingFailure(context, "GEMM1 SetAType failed, rc=" + std::to_string(mm1SetATypeRc));
-    }
-    const int32_t mm1SetBTypeRc = mm1Tiling.SetBType(
-        matmul_tiling::TPosition::GM,
-        nzConv ? matmul_tiling::CubeFormat::NZ : matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_BFLOAT16, false); // GEMM1：B 非转置（nzConv 时为 NZ 副本）
-    if (mm1SetBTypeRc != 0) {
-        return ReportTilingFailure(context, "GEMM1 SetBType failed, rc=" + std::to_string(mm1SetBTypeRc));
-    }
-    // c 内部布局改为 NZ：GEMM1 直接写 NZ，GEMM2 直接读 NZ，省掉 GEMM2 A 的 ND→NZ。
-    const int32_t mm1SetCTypeRc = mm1Tiling.SetCType(
-        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::NZ,
-        matmul_tiling::DataType::DT_BFLOAT16);
-    if (mm1SetCTypeRc != 0) {
-        return ReportTilingFailure(context, "GEMM1 SetCType failed, rc=" + std::to_string(mm1SetCTypeRc));
-    }
-    const int32_t mm1SetShapeRc = mm1Tiling.SetShape(
-        static_cast<int32_t>(pipeTileRows), static_cast<int32_t>(gemm1SingleNMax),
-        static_cast<int32_t>(MLA_K1));
-    if (mm1SetShapeRc != 0) {
-        return ReportTilingFailure(context, "GEMM1 SetShape failed, rc=" + std::to_string(mm1SetShapeRc) +
-                                                 " (M=" + std::to_string(pipeTileRows) +
-                                                 " N=" + std::to_string(gemm1SingleNMax) +
-                                                 " K=" + std::to_string(MLA_K1) + ")");
-    }
-    // r2 优化（MDL 大块搬运）：GEMM1 不调用 SetFixSplit，baseN/baseK 交回库选择
-    // （库默认 baseN=256 / baseK=64，L0B 双缓冲 256×64×2×2 B = 65,536 = 64 KB 恰好占满）。
-    // 实测（S=96，MDL 调度）：库默认时 GEMM1 阶段 102.3 us；强制 baseN=320 会被库降 baseK=32
-    // （L0B 双缓冲放不下 320×64×2×2 B），阶段反而 116.4 us。故显式保持库默认。
-    // Host 仅 3 参：C 的 8192 行跨度由 Kernel 侧 SetOrgShape 的 orgKc 承担（P4 首个样例核对）
-    const int32_t mm1OrgShapeRc =
-        mm1Tiling.SetOrgShape(static_cast<int32_t>(paddedM), static_cast<int32_t>(MLA_N1),
-                              static_cast<int32_t>(MLA_K1));
-    if (mm1OrgShapeRc != 0) {
-        return ReportTilingFailure(context, "GEMM1 SetOrgShape failed, rc=" + std::to_string(mm1OrgShapeRc) +
-                                                 " (M=" + std::to_string(paddedM) +
-                                                 " N=" + std::to_string(MLA_N1) +
-                                                 " K=" + std::to_string(MLA_K1) + ")");
-    }
-    const int64_t mm1GetTilingRc = mm1Tiling.GetTiling(tiling->gemm1Tiling);
-    if (mm1GetTilingRc != 0) {
-        return ReportTilingFailure(context, "GEMM1 GetTiling failed, rc=" + std::to_string(mm1GetTilingRc) +
-                                                 " (M=" + std::to_string(pipeTileRows) +
-                                                 " N=" + std::to_string(gemm1SingleNMax) +
-                                                 " K=" + std::to_string(MLA_K1) + ")");
-    }
-
-    matmul_tiling::MatmulApiTiling mm2Tiling(platform);
-    // c 是 GEMM1 的 NZ 输出，GEMM2 A 直接按 NZ 读取。
-    const int32_t mm2SetATypeRc = mm2Tiling.SetAType(
-        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::NZ,
-        matmul_tiling::DataType::DT_BFLOAT16, false);
-    if (mm2SetATypeRc != 0) {
-        return ReportTilingFailure(context, "GEMM2 SetAType failed, rc=" + std::to_string(mm2SetATypeRc));
-    }
-    const int32_t mm2SetBTypeRc = mm2Tiling.SetBType(
-        matmul_tiling::TPosition::GM,
-        nzConv ? matmul_tiling::CubeFormat::NZ : matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_BFLOAT16, true); // GEMM2：B 转置（nzConv 时为 NZ 副本）
-    if (mm2SetBTypeRc != 0) {
-        return ReportTilingFailure(context, "GEMM2 SetBType failed, rc=" + std::to_string(mm2SetBTypeRc));
-    }
-    const int32_t mm2SetCTypeRc = mm2Tiling.SetCType(
-        matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
-        matmul_tiling::DataType::DT_BFLOAT16);
-    if (mm2SetCTypeRc != 0) {
-        return ReportTilingFailure(context, "GEMM2 SetCType failed, rc=" + std::to_string(mm2SetCTypeRc));
-    }
-    const int32_t mm2SetShapeRc = mm2Tiling.SetShape(
-        static_cast<int32_t>(totalS), static_cast<int32_t>(gemm2SingleNMax),
-        static_cast<int32_t>(MLA_K2));
-    if (mm2SetShapeRc != 0) {
-        return ReportTilingFailure(context, "GEMM2 SetShape failed, rc=" + std::to_string(mm2SetShapeRc) +
-                                                 " (M=" + std::to_string(totalS) +
-                                                 " N=" + std::to_string(gemm2SingleNMax) +
-                                                 " K=" + std::to_string(MLA_K2) + ")");
-    }
-    const int32_t mm2OrgShapeRc =
-        mm2Tiling.SetOrgShape(static_cast<int32_t>(totalS), static_cast<int32_t>(MLA_N2),
-                              static_cast<int32_t>(MLA_K2));
-    if (mm2OrgShapeRc != 0) {
-        return ReportTilingFailure(context, "GEMM2 SetOrgShape failed, rc=" + std::to_string(mm2OrgShapeRc) +
-                                                 " (M=" + std::to_string(totalS) +
-                                                 " N=" + std::to_string(MLA_N2) +
-                                                 " K=" + std::to_string(MLA_K2) + ")");
-    }
-    // baseM 交给库按 L0A/L0C 约束自选（-1 = 不指定），只锁定 baseN/baseK（见 §6 注释）
-    const int32_t mm2FixSplitRc =
-        mm2Tiling.SetFixSplit(-1, static_cast<int32_t>(gemm2BaseN), static_cast<int32_t>(gemm2BaseK));
-    if (mm2FixSplitRc != 0) {
-        return ReportTilingFailure(context, "GEMM2 SetFixSplit failed, rc=" + std::to_string(mm2FixSplitRc) +
-                                                 " (baseM=-1 baseN=" + std::to_string(gemm2BaseN) +
-                                                 " baseK=" + std::to_string(gemm2BaseK) + ")");
-    }
-    const int64_t mm2GetTilingRc = mm2Tiling.GetTiling(tiling->gemm2Tiling);
-    if (mm2GetTilingRc != 0) {
-        return ReportTilingFailure(context, "GEMM2 GetTiling failed, rc=" + std::to_string(mm2GetTilingRc) +
-                                                 " (M=" + std::to_string(totalS) +
-                                                 " N=" + std::to_string(gemm2SingleNMax) +
-                                                 " K=" + std::to_string(MLA_K2) + ")");
-    }
-
-    // GetTiling 后按手工分核覆写 M/N/Ka/Kb、singleCoreM/singleCoreN；
-    // usedCoreNum 保持单核 GetTiling 给出的值（P7：不改写为 (M/singleCoreM)*(N/singleCoreN)）
-    tiling->gemm1Tiling.M = static_cast<int32_t>(pipeTileRows);
-    tiling->gemm1Tiling.N = static_cast<int32_t>(gemm1SingleNMax);
-    tiling->gemm1Tiling.Ka = static_cast<int32_t>(MLA_K1);
-    tiling->gemm1Tiling.Kb = static_cast<int32_t>(MLA_K1);
-    tiling->gemm1Tiling.singleCoreM = static_cast<int32_t>(pipeTileRows);
-    tiling->gemm1Tiling.singleCoreN = static_cast<int32_t>(gemm1SingleNMax);
-    tiling->gemm1Tiling.singleCoreK = static_cast<int32_t>(MLA_K1);
-
-    tiling->gemm2Tiling.M = static_cast<int32_t>(totalS);
-    tiling->gemm2Tiling.N = static_cast<int32_t>(gemm2SingleNMax);
-    tiling->gemm2Tiling.Ka = static_cast<int32_t>(MLA_K2);
-    tiling->gemm2Tiling.Kb = static_cast<int32_t>(MLA_K2);
-    tiling->gemm2Tiling.singleCoreM = static_cast<int32_t>(totalS);
-    tiling->gemm2Tiling.singleCoreN = static_cast<int32_t>(gemm2SingleNMax);
-    tiling->gemm2Tiling.singleCoreK = static_cast<int32_t>(MLA_K2);
-
-    // ---- 8. Matmul 片上临时空间实测核算（M-10 口径；AIC/AIV 独立、不叠加不互扣）----
-    uint64_t l1Size = 0ULL;
-    uint64_t l0cSize = 0ULL;
-    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L1, l1Size);
-    platform.GetCoreMemSize(platform_ascendc::CoreMemType::L0_C, l0cSize);
-    if (l1Size == 0ULL) {
-        return ReportTilingFailure(context, "GetCoreMemSize(L1) returned 0");
-    }
-    if (l0cSize == 0ULL) {
-        return ReportTilingFailure(context, "GetCoreMemSize(L0_C) returned 0");
-    }
-
-    // ---- 8a. MDL 大块搬运调度参数覆写（性能优化 r2；不满足整除/L1 约束时自动保留库值）----
-    const bool g1StepOk = ApplyMdlStepTiling(tiling->gemm1Tiling, 8, 2, l1Size);
-    const bool g2StepOk = ApplyMdlStepTiling(tiling->gemm2Tiling, 8, 4, l1Size);
-
-    matmul_tiling::SysTilingTempBufSize mm1Buf;
-    matmul_tiling::SysTilingTempBufSize mm2Buf;
-    const int32_t mm1BufRc = MatmulGetTmpBufSizeV2(tiling->gemm1Tiling, mm1Buf);
-    if (mm1BufRc != 0) {
-        return ReportTilingFailure(context, "MatmulGetTmpBufSizeV2(GEMM1) failed, rc=" + std::to_string(mm1BufRc) +
-                                                 " (M=" + std::to_string(tiling->gemm1Tiling.M) +
-                                                 " N=" + std::to_string(tiling->gemm1Tiling.N) +
-                                                 " K=" + std::to_string(tiling->gemm1Tiling.Ka) +
-                                                 " baseN=" + std::to_string(tiling->gemm1Tiling.baseN) +
-                                                 " baseK=" + std::to_string(tiling->gemm1Tiling.baseK) + ")");
-    }
-    const int32_t mm2BufRc = MatmulGetTmpBufSizeV2(tiling->gemm2Tiling, mm2Buf);
-    if (mm2BufRc != 0) {
-        return ReportTilingFailure(context, "MatmulGetTmpBufSizeV2(GEMM2) failed, rc=" + std::to_string(mm2BufRc) +
-                                                 " (M=" + std::to_string(tiling->gemm2Tiling.M) +
-                                                 " N=" + std::to_string(tiling->gemm2Tiling.N) +
-                                                 " K=" + std::to_string(tiling->gemm2Tiling.Ka) +
-                                                 " baseN=" + std::to_string(tiling->gemm2Tiling.baseN) +
-                                                 " baseK=" + std::to_string(tiling->gemm2Tiling.baseK) + ")");
-    }
-    if (static_cast<uint64_t>(mm1Buf.l1Size) > l1Size || static_cast<uint64_t>(mm2Buf.l1Size) > l1Size) {
-        return ReportTilingFailure(context, "Matmul L1 need g1=" + std::to_string(mm1Buf.l1Size) +
-                                                 " g2=" + std::to_string(mm2Buf.l1Size) +
-                                                 " > L1 " + std::to_string(l1Size));
-    }
-    if (static_cast<uint64_t>(mm1Buf.l0cSize) > l0cSize || static_cast<uint64_t>(mm2Buf.l0cSize) > l0cSize) {
-        return ReportTilingFailure(context, "Matmul L0C need g1=" + std::to_string(mm1Buf.l0cSize) +
-                                                 " g2=" + std::to_string(mm2Buf.l0cSize) +
-                                                 " > L0C " + std::to_string(l0cSize));
-    }
-    if (static_cast<uint64_t>(mm1Buf.ubSize) > usableUB || static_cast<uint64_t>(mm2Buf.ubSize) > usableUB) {
-        return ReportTilingFailure(context, "Matmul UB peak g1=" + std::to_string(mm1Buf.ubSize) +
-                                                 " g2=" + std::to_string(mm2Buf.ubSize) +
-                                                 " > usableUB " + std::to_string(usableUB));
-    }
-
     // ---- 9. workspace（用户区 r/c + 系统区）----
     const uint64_t rBytes =
         static_cast<uint64_t>(MLA_G) * static_cast<uint64_t>(paddedM) * static_cast<uint64_t>(MLA_K1) * 2ULL;
     const uint64_t cBytes =
         static_cast<uint64_t>(paddedM) * static_cast<uint64_t>(MLA_G) * static_cast<uint64_t>(MLA_N1) * 2ULL;
+    // CATLASS 只使用 GM 上的 r/c 中间结果；w1/w2 直接以 ND 读取，不再生成 NZ 副本。
     const uint64_t cOffset = AlignUpU64(rBytes, WS_ALIGN);
-    // nzConv 时追加 w1/w2 的 NZ 副本（各与 ND 原权重同字节数）
-    const uint64_t w1NzBytes =
-        nzConv ? static_cast<uint64_t>(MLA_G) * static_cast<uint64_t>(MLA_K1) * static_cast<uint64_t>(MLA_N1) * 2ULL
-               : 0ULL;
-    const uint64_t w2NzBytes =
-        nzConv ? static_cast<uint64_t>(MLA_K2) * static_cast<uint64_t>(MLA_N2) * 2ULL : 0ULL;
-    const uint64_t w1NzOffset = cOffset + AlignUpU64(cBytes, WS_ALIGN);
-    const uint64_t w2NzOffset = w1NzOffset + AlignUpU64(w1NzBytes, WS_ALIGN);
-    const uint64_t userWorkspaceSize = w2NzOffset + AlignUpU64(w2NzBytes, WS_ALIGN);
+    const uint64_t userWorkspaceSize = cOffset + AlignUpU64(cBytes, WS_ALIGN);
     const uint32_t sysWorkspaceSize = platform.GetLibApiWorkSpaceSize();
     if (sysWorkspaceSize == UINT32_MAX) {
         return ReportTilingFailure(context, "GetLibApiWorkSpaceSize() returned UINT32_MAX");
@@ -701,19 +435,14 @@ static ge::graphStatus TilingMlaEpilogue(gert::TilingContext* context)
     tiling->rOffset = 0ULL;
     tiling->cOffset = cOffset;
     tiling->userWorkspaceSize = userWorkspaceSize;
-    tiling->nzConv = nzConv ? 1U : 0U;
-    tiling->nzPad = 0U;
-    tiling->w1NzOffset = w1NzOffset;
-    tiling->w2NzOffset = w2NzOffset;
 
-    // ---- 11. P1/P2/P4/P6/P7 取证日志（首个样例据此核对）----
+    // ---- 11. 取证日志 ----
     OP_LOGI(context,
             "tiling: S=%u paddedM=%u padRows=%u aicNum=%u aivNum=%u ubSize=%lu usableUB=%lu "
-            "sysWs=%u userWs=%lu totalWs=%lu nzConv=%u",
+            "sysWs=%u userWs=%lu totalWs=%lu",
             totalS, paddedM, padRows, aicNum, aivNum, static_cast<unsigned long>(ubSize),
             static_cast<unsigned long>(usableUB), sysWorkspaceSize, static_cast<unsigned long>(userWorkspaceSize),
-            static_cast<unsigned long>(userWorkspaceSize + static_cast<uint64_t>(sysWorkspaceSize)),
-            static_cast<unsigned>(nzConv ? 1U : 0U));
+            static_cast<unsigned long>(userWorkspaceSize + static_cast<uint64_t>(sysWorkspaceSize)));
     OP_LOGI(context,
             "RoPE: tileS=%u pipeTileNum=%u pipeTileRows=%u sTileNum=%u ropeTaskNum=%u "
             "ropeTasksPerCore=%u aivUsedCores=%u ropeUB=%lu (fixedUB=%lu rowUB=%lu)",
@@ -721,40 +450,16 @@ static ge::graphStatus TilingMlaEpilogue(gert::TilingContext* context)
             static_cast<unsigned long>(ropeUB), static_cast<unsigned long>(ROPE_FIXED_UB),
             static_cast<unsigned long>(ROPE_ROW_UB));
     OP_LOGI(context,
-            "GEMM1[%s]: nSplit=%u base=%u last=%u singleNMax=%u singleM=%u usedCores=%u | tiling "
-            "usedCoreNum=%d M=%d N=%d Ka=%d Kb=%d singleCoreM=%d singleCoreN=%d singleCoreK=%d "
-            "baseM=%d baseN=%d baseK=%d stepM=%d stepN=%d stepKa=%d stepKb=%d depthA1=%d depthB1=%d "
-            "dbL0A=%d dbL0B=%d dbL0C=%d",
-            (g1StepOk ? "r2step" : "libstep"),
-            nSplit, base1, last1, gemm1SingleNMax, pipeTileRows, gemm1UsedCores, tiling->gemm1Tiling.usedCoreNum,
-            tiling->gemm1Tiling.M, tiling->gemm1Tiling.N, tiling->gemm1Tiling.Ka, tiling->gemm1Tiling.Kb,
-            tiling->gemm1Tiling.singleCoreM, tiling->gemm1Tiling.singleCoreN, tiling->gemm1Tiling.singleCoreK,
-            tiling->gemm1Tiling.baseM, tiling->gemm1Tiling.baseN, tiling->gemm1Tiling.baseK,
-            tiling->gemm1Tiling.stepM, tiling->gemm1Tiling.stepN, tiling->gemm1Tiling.stepKa,
-            tiling->gemm1Tiling.stepKb, tiling->gemm1Tiling.depthA1, tiling->gemm1Tiling.depthB1,
-            tiling->gemm1Tiling.dbL0A, tiling->gemm1Tiling.dbL0B, tiling->gemm1Tiling.dbL0C);
+            "GEMM1: nSplit=%u base=%u last=%u singleNMax=%u singleM=%u usedCores=%u",
+            nSplit, base1, last1, gemm1SingleNMax, pipeTileRows, gemm1UsedCores);
     OP_LOGI(context,
-            "GEMM2[%s]: base=%u rem=%u singleNMax=%u fixBaseN=%u fixBaseK=%u singleM=%u usedCores=%u | tiling usedCoreNum=%d "
-            "M=%d N=%d Ka=%d Kb=%d singleCoreM=%d singleCoreN=%d singleCoreK=%d baseM=%d baseN=%d baseK=%d "
-            "stepM=%d stepN=%d stepKa=%d stepKb=%d depthA1=%d depthB1=%d dbL0A=%d dbL0B=%d dbL0C=%d "
-            "(host SetBType isTrans=true)",
-            (g2StepOk ? "r2step" : "libstep"),
-            base2, rem2, gemm2SingleNMax, gemm2BaseN, gemm2BaseK, totalS, gemm2UsedCores, tiling->gemm2Tiling.usedCoreNum,
-            tiling->gemm2Tiling.M, tiling->gemm2Tiling.N, tiling->gemm2Tiling.Ka, tiling->gemm2Tiling.Kb,
-            tiling->gemm2Tiling.singleCoreM, tiling->gemm2Tiling.singleCoreN, tiling->gemm2Tiling.singleCoreK,
-            tiling->gemm2Tiling.baseM, tiling->gemm2Tiling.baseN, tiling->gemm2Tiling.baseK,
-            tiling->gemm2Tiling.stepM, tiling->gemm2Tiling.stepN, tiling->gemm2Tiling.stepKa,
-            tiling->gemm2Tiling.stepKb, tiling->gemm2Tiling.depthA1, tiling->gemm2Tiling.depthB1,
-            tiling->gemm2Tiling.dbL0A, tiling->gemm2Tiling.dbL0B, tiling->gemm2Tiling.dbL0C);
-    OP_LOGI(context,
-            "MatmulGetTmpBufSize: g1 ub=%d l1=%d l0c=%d | g2 ub=%d l1=%d l0c=%d | capacity "
-            "l1=%lu l0c=%lu usableUB=%lu",
-            mm1Buf.ubSize, mm1Buf.l1Size, mm1Buf.l0cSize, mm2Buf.ubSize, mm2Buf.l1Size, mm2Buf.l0cSize,
-            static_cast<unsigned long>(l1Size), static_cast<unsigned long>(l0cSize),
-            static_cast<unsigned long>(usableUB));
+            "GEMM2: base=%u rem=%u singleNMax=%u singleM=%u usedCores=%u",
+            base2, rem2, gemm2SingleNMax, totalS, gemm2UsedCores);
 
     // ---- 12. TilingKey / batchmode / blockDim ----
-    ASCENDC_TPL_SEL_PARAM(context, 0U);
+    // 大 S 使用独立模板（更大的 M tile），小 S 保持原模板。
+    const uint32_t schMode = (totalS > 128U) ? 1U : 0U;
+    ASCENDC_TPL_SEL_PARAM(context, schMode);
     const ge::graphStatus scheduleModeRc = context->SetScheduleMode(1);
     if (scheduleModeRc != ge::GRAPH_SUCCESS) {
         return ReportTilingFailure(context, "SetScheduleMode(1) failed, rc=" +

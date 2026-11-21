@@ -10,146 +10,142 @@
 
 /*!
  * \file mla_epilogue_gemm.h
- * \brief mla_epilogue AIC 侧计算上下文：GEMM1 / GEMM2（DESIGN §3.5）
+ * \brief mla_epilogue AIC 侧 CATLASS 实现：GEMM1 / GEMM2
  *
- * 约束（DESIGN §3.5 / DC-2 / DC-5 / DC-8）：
- *  - 仅在 ASCEND_IS_AIC 分支内初始化与调用；本文件不含任何 SyncAll，屏障只存在于 Kernel 入口公共控制流；
- *  - GEMM1 B 使用 bType（ISTRANS=false），运行时 SetTensorB(..., false)；
- *    GEMM2 B 使用 bTypeTrans（ISTRANS=true），运行时 SetTensorB(..., true)，三处（Host SetBType /
- *    MatmulType ISTRANS / 运行时 isTransposeB）必须一致（P6）；
- *  - 手工分核：每核自行用核号推导 (g, nIdx) 与 n0/curN，再以 SetSingleShape + 预偏移指针下发；
- *    不依赖 TCubeTiling.usedCoreNum 的均匀切分（不改写 usedCoreNum，P7）；
- *    GEMM1 的 N 切分按 128 B（64 元素）对齐，消除 MTE2 非对齐请求的 sector 浪费；
- *  - REGIST_MATMUL_OBJ 必须早于本 pipe 的任何 InitBuffer（由 Kernel 入口保证调用顺序）。
+ * 约束：
+ *  - 仅在 ASCEND_IS_AIC 分支内构造/调用；Arch::Resource<Arch::AtlasA2> 由 Kernel 入口在 AIC 分支提供；
+ *  - GEMM1：A/B RowMajor，C layout::zN（Cube NZ），供 GEMM2 直接作为 A 读取；
+ *  - GEMM2：A layout::zN，B ColumnMajor（w2 物理 [N,K]），C RowMajor 直接写 y；
+ *  - 每核 N 分核与 Host tiling 的 n0/curN 保持一致；M 方向按编译期 L1 tile 循环；
+ *  - 本文件不含 SyncAll；AIV→AIC 的唯一屏障在 Kernel 入口。
  */
 
 #ifndef __MLA_EPILOGUE_GEMM_H__
 #define __MLA_EPILOGUE_GEMM_H__
 
+#ifndef K_MAX_SHAPE_DIM
+#define K_MAX_SHAPE_DIM 0
+#endif
+
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
-#include "lib/matmul_intf.h"
 #include "mla_epilogue_tiling_data.h"
+
+#include "catlass/catlass.hpp"
+#include "catlass/arch/arch.hpp"
+#include "catlass/arch/resource.hpp"
+#include "catlass/gemm/block/block_mmad.hpp"
+#include "catlass/gemm/dispatch_policy.hpp"
+#include "catlass/gemm/gemm_type.hpp"
+#include "catlass/gemm/tile/tile_copy.hpp"
+#include "catlass/layout/layout.hpp"
+#include "tla/layout.hpp"
+#include "tla/tensor.hpp"
 
 namespace NsMlaEpilogue {
 using namespace AscendC;
+using Catlass::GemmCoord;
 
-// Matmul 矩阵类型（DESIGN §3.5）：GEMM1 B 非转置；GEMM2 B 转置，类型必须带 ISTRANS=true
-using aType = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t>;
-using bType = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t>;         // ISTRANS=false：GEMM1 非转置
-using bTypeTrans = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t, true>; // ISTRANS=true：GEMM2 B 转置
-using cType = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t>;
-using aTypeNz = MatmulType<TPosition::GM, CubeFormat::NZ, bfloat16_t>;   // GEMM2 A（内部 c，NZ）
-using cTypeNz = MatmulType<TPosition::GM, CubeFormat::NZ, bfloat16_t>;   // GEMM1 C（内部 c，NZ）
-// nzConv（大 S 门控）：w1/w2 由 kernel 内 AIV 预转换成 NZ 后使用（不改接口）
-using bTypeNz = MatmulType<TPosition::GM, CubeFormat::NZ, bfloat16_t>;          // GEMM1 B 非转置 NZ
-using bTypeTransNz = MatmulType<TPosition::GM, CubeFormat::NZ, bfloat16_t, true>; // GEMM2 B 转置 NZ
-using biasType = MatmulType<TPosition::GM, CubeFormat::ND, float>;
+using CatlassElement = bfloat16_t;
+using CatlassArch = Catlass::Arch::AtlasA2;
+
+// ---------------------------------------------------------------------------
+// GEMM1: r[g][M,K1] @ w1[g][K1,N1] -> c[g][M,N1], C 为 Cube NZ
+// ---------------------------------------------------------------------------
+using G1Policy = Catlass::Gemm::MmadPingpong<CatlassArch, true, false, 1, false, 2, 2, 3, 2>;
+using G1L1Shape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
+using G1L0Shape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<64>>;
+using G1TileCopy = Catlass::Gemm::Tile::PackedTileCopyTla<
+    CatlassArch, CatlassElement, Catlass::layout::RowMajor, CatlassElement, Catlass::layout::RowMajor,
+    CatlassElement, Catlass::layout::zN>;
+using G1Block = Catlass::Gemm::Block::BlockMmadTla<
+    G1Policy, G1L1Shape, G1L0Shape, CatlassElement, CatlassElement, CatlassElement, void, G1TileCopy>;
+
+// ---------------------------------------------------------------------------
+// GEMM2: c[M,K2] @ w2[N2,K2]^T -> y[M,N2], A 为 Cube NZ，B 用 ColumnMajor 表达转置
+// ---------------------------------------------------------------------------
+using G2Policy = Catlass::Gemm::MmadPingpong<CatlassArch, true, false, 1, false, 2, 2, 3, 2>;
+using G2L1Shape = tla::Shape<tla::Int<96>, tla::Int<224>, tla::Int<384>>;
+using G2L0Shape = tla::Shape<tla::Int<96>, tla::Int<224>, tla::Int<64>>;
+using G2TileCopy = Catlass::Gemm::Tile::PackedTileCopyTla<
+    CatlassArch, CatlassElement, Catlass::layout::zN, CatlassElement, Catlass::layout::ColumnMajor,
+    CatlassElement, Catlass::layout::RowMajor>;
+using G2Block = Catlass::Gemm::Block::BlockMmadTla<
+    G2Policy, G2L1Shape, G2L0Shape, CatlassElement, CatlassElement, CatlassElement, void, G2TileCopy>;
 
 /**
- * @brief AIC 侧计算上下文：持有 mm1 / mm2 与 GM 视图
+ * @brief AIC 侧 CATLASS 计算上下文
  *
- * 构造只声明 Matmul 对象，不调用任何 Matmul API；Init/Gemm1Tile/Gemm2 全部只在 AIC 分支内执行。
+ * 由 Kernel 入口在 ASCEND_IS_AIC 分支内构造；resource 的生命周期覆盖两次 GEMM。
+ * BlockMmadTla 使用局部作用域依次构造/析构，确保 L0/L0C 与 event ID 不会同时占用。
  */
 class AicContext {
 public:
-    __aicore__ inline void Init(const MlaEpilogueTilingData& td, TPipe* pipe, GM_ADDR userWs, GM_ADDR w1,
-                                GM_ADDR w2, GM_ADDR y)
+    __aicore__ inline explicit AicContext(Catlass::Arch::Resource<CatlassArch>& resource) : resource_(resource) {}
+
+    __aicore__ inline void Init(const MlaEpilogueTilingData& td, GM_ADDR userWs, GM_ADDR w1, GM_ADDR w2, GM_ADDR y)
     {
-        // 用户 workspace 视图：r[8, paddedM, 4096] / c[paddedM, 8192]（DESIGN §3.3 / §3.9）
         rGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(userWs + td.rOffset));
         cGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(userWs + td.cOffset));
         w1Gm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(w1));
         w2Gm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(w2));
         yGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(y));
-
-        // nzConv 时 B 指向 workspace 内的 NZ 副本（由 AIV 在 GEMM1 前/GEMM1 期间转换）
-        nz_ = (td.nzConv != 0U);
-        w1NzGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(userWs + td.w1NzOffset));
-        w2NzGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(userWs + td.w2NzOffset));
-
-        // 系统 workspace 交给框架；必须在任何 InitBuffer 之前（DESIGN §3.4 第 7 步）
-        // 两套 Matmul 实例按运行期开关二选一 Init：NORM(ND) 与 NZ 各一套，避免运行期切换 B 格式。
-        if (nz_) {
-            REGIST_MATMUL_OBJ(pipe, GetSysWorkSpacePtr(), mm1Nz_, &td.gemm1Tiling, mm2Nz_, &td.gemm2Tiling);
-        } else {
-            REGIST_MATMUL_OBJ(pipe, GetSysWorkSpacePtr(), mm1_, &td.gemm1Tiling, mm2_, &td.gemm2Tiling);
-        }
     }
 
     /**
-     * @brief GEMM1 第 t 个流水段：r[g] 的第 [m0, m0+curM) 行 × w1[g] 的本核 N 列块 → c 对应块
-     *        纯计算体，不含 SyncAll（屏障由入口公共控制流给出）。
+     * @brief GEMM1：每核固定 (g, n0, curN)，循环 M tile 与 N tile。
+     *        C 为 layout::zN，物理布局 [N/16][M/16][16][16]。
      */
-    __aicore__ inline void Gemm1Tile(uint32_t t, const MlaEpilogueTilingData& td)
-    {
-        if (nz_) {
-            Gemm1TileImpl(mm1Nz_, t, td);
-        } else {
-            Gemm1TileImpl(mm1_, t, td);
-        }
-    }
-
-    template <typename MM>
-    __aicore__ inline void Gemm1TileImpl(MM& mm1, uint32_t t, const MlaEpilogueTilingData& td)
+    __aicore__ inline void Gemm1(const MlaEpilogueTilingData& td)
     {
         const uint32_t coreIdx = static_cast<uint32_t>(GetBlockIdx());
         if (coreIdx >= td.gemm1UsedCores) {
-            return; // 未承担本段计算的核：只跳过计算体，仍参与入口屏障
+            return;
         }
         const uint32_t nSplit = td.gemm1CoresPerBatch;
         const uint32_t g = coreIdx / nSplit;
         const uint32_t nIdx = coreIdx - g * nSplit;
-        // 128 B 对齐分核（性能优化）：前 nSplit-1 个核各取 gemm1NUnitsBase 个 16 元素单元，
-        // 最后一个核取 gemm1NUnitsLast 个（吃掉余数）。Host 保证 base 是 4 单元（64 元素 = 128 B）
-        // 的整数倍，因此每个核的列块起点 n0 都落在 128 B 边界上，MTE2 的 GM→L1 请求不跨 sector。
-        // 约束校验（base*(nSplit-1) + last == n1Units）在 Host tiling 完成。
         const bool isLast = ((nIdx + 1U) >= nSplit);
         const uint32_t nUnits = isLast ? td.gemm1NUnitsLast : td.gemm1NUnitsBase;
         const uint32_t n0 = MLA_ALIGN16 * (isLast ? ((nSplit - 1U) * td.gemm1NUnitsBase) :
                                                      (nIdx * td.gemm1NUnitsBase));
         const uint32_t curN = MLA_ALIGN16 * nUnits;
 
-        const uint32_t m0 = t * td.pipeTileRows;
-        const uint32_t restM = td.paddedM - m0;
-        const uint32_t curM = (td.pipeTileRows < restM) ? td.pipeTileRows : restM;
+        // 每个 batch 的完整 A/B/C 视图；tile 由 GetTile 生成，stride 保持全局布局。
+        auto gA = rGm_[static_cast<uint64_t>(g) * td.paddedM * MLA_K1];
+        auto gB = w1Gm_[static_cast<uint64_t>(g) * MLA_K1 * MLA_N1];
+        auto gC = cGm_[static_cast<uint64_t>(g) * MLA_N1 * td.paddedM];
+        auto layoutA = tla::MakeLayout<CatlassElement, Catlass::layout::RowMajor>(td.paddedM, MLA_K1);
+        auto layoutB = tla::MakeLayout<CatlassElement, Catlass::layout::RowMajor>(MLA_K1, MLA_N1);
+        auto layoutC = tla::MakeLayout<CatlassElement, Catlass::layout::zN>(td.paddedM, MLA_N1);
+        auto tensorA = tla::MakeTensor(gA, layoutA, Catlass::Arch::PositionGM{});
+        auto tensorB = tla::MakeTensor(gB, layoutB, Catlass::Arch::PositionGM{});
+        auto tensorC = tla::MakeTensor(gC, layoutC, Catlass::Arch::PositionGM{});
 
-        // 5 参 SetOrgShape：orgKc = MLA_G * N1 = 8192 为 C（c 的 [paddedM, 8192]）行跨度，
-        // 与 B 的 orgN（N1 = 1024）不同；必须在 SetTensorA/SetTensorB/SetSingleShape 之前调用（P4）
-        mm1.SetOrgShape(static_cast<int32_t>(td.paddedM), static_cast<int32_t>(MLA_N1), static_cast<int32_t>(MLA_K1),
-                        static_cast<int32_t>(MLA_K1), static_cast<int32_t>(MLA_G * MLA_N1));
-        // r 布局 [8, paddedM, 4096]，第 t 段从行 m0 起，行跨度仍为 K1
-        mm1.SetTensorA(rGm_[static_cast<uint64_t>(g) * td.paddedM * MLA_K1 + static_cast<uint64_t>(m0) * MLA_K1],
-                       false);
-        // w1[g]：ND 时 [K1, N1] 取 n0；NZ 时 [N1/16][K1][16] 取 n0*K1
-        const uint64_t bOff = static_cast<uint64_t>(g) * MLA_K1 * MLA_N1 +
-                              (nz_ ? static_cast<uint64_t>(n0) * MLA_K1 : static_cast<uint64_t>(n0));
-        mm1.SetTensorB(nz_ ? w1NzGm_[bOff] : w1Gm_[bOff], false);
-        // 覆盖内建单核形状：M 为本段行数（末段可小），N 为本核列块（320/320/384，128 B 对齐）
-        mm1.SetSingleShape(static_cast<int32_t>(curM), static_cast<int32_t>(curN), static_cast<int32_t>(MLA_K1));
-        // c 布局改为 NZ：[G*N1/16][paddedM/16][16][16]；本核（nIdx 0/1 的 320/384 列）
-        // 是 g 对应 batch 块内从 n0 开始的连续 N 切片。当前 pipeTileNum=1、m0=0，
-        // 每个 core 的 C 块覆盖完整 paddedM 行，因此偏移 = g*N1*paddedM + n0*paddedM。
-        const uint64_t cNzOff = static_cast<uint64_t>(g) * MLA_N1 * td.paddedM +
-                                static_cast<uint64_t>(n0) * td.paddedM;
-        mm1.IterateAll(cGm_[cNzOff], 0, false);
-    }
+        {
+            G1Block blockMmad(resource_);
+            constexpr uint32_t kM = tla::get<0>(G1L1Shape{});
+            constexpr uint32_t kN = tla::get<1>(G1L1Shape{});
 
-    /**
-     * @brief GEMM2：c_flat[S, 8192] @ w2[N2, K2]^T → y[S, 5120]（本核 N 列块）
-     *        纯计算体，不含 SyncAll。
-     */
-    __aicore__ inline void Gemm2(const MlaEpilogueTilingData& td)
-    {
-        if (nz_) {
-            Gemm2Impl(mm2Nz_, td);
-        } else {
-            Gemm2Impl(mm2_, td);
+            for (uint32_t m0 = 0U; m0 < td.totalS; m0 += kM) {
+                const uint32_t mAct = min(kM, td.totalS - m0);
+                auto tileA = tla::GetTile(tensorA, tla::MakeCoord(m0, 0U), tla::MakeShape(mAct, MLA_K1));
+                for (uint32_t nOff = 0U; nOff < curN; nOff += kN) {
+                    const uint32_t nAct = min(kN, curN - nOff);
+                    auto tileB = tla::GetTile(tensorB, tla::MakeCoord(0U, n0 + nOff),
+                                              tla::MakeShape(MLA_K1, nAct));
+                    auto tileC = tla::GetTile(tensorC, tla::MakeCoord(m0, n0 + nOff),
+                                              tla::MakeShape(mAct, nAct));
+                    blockMmad(tileA, tileB, tileC, GemmCoord{mAct, nAct, MLA_K1});
+                }
+            }
         }
     }
 
-    template <typename MM>
-    __aicore__ inline void Gemm2Impl(MM& mm2, const MlaEpilogueTilingData& td)
+    /**
+     * @brief GEMM2：每核固定 n0/curN，M 方向按 96 行循环；A 直接读 GEMM1 的 zN 输出。
+     */
+    __aicore__ inline void Gemm2(const MlaEpilogueTilingData& td)
     {
         const uint32_t coreIdx = static_cast<uint32_t>(GetBlockIdx());
         if (coreIdx >= td.gemm2UsedCores) {
@@ -161,61 +157,38 @@ public:
                                            ((coreIdx < td.gemm2NUnitsRem) ? coreIdx : td.gemm2NUnitsRem));
         const uint32_t curN = MLA_ALIGN16 * nUnits;
 
-        // A 是 NZ 的 c：orgM 必须用 paddedM（c 的 M 方向按 paddedM 排），
-        // 计算 M 仍由 SetSingleShape(totalS, ...) 指定；否则 S 非 16 对齐时 A 的 NZ stride 会错位。
-        mm2.SetOrgShape(static_cast<int32_t>(td.paddedM), static_cast<int32_t>(MLA_N2), static_cast<int32_t>(MLA_K2));
-        mm2.SetTensorA(cGm_[0], false); // c 即 c_flat[S, 8192]，K 维连续
-        // w2 按 B 转置使用（存储 [N2, K2]）：ND 取 n0*K2；NZ 布局 [K2/16][N2][16] 取 n0*16
-        const uint64_t bOff = nz_ ? (static_cast<uint64_t>(n0) * 16U) : (static_cast<uint64_t>(n0) * MLA_K2);
-        mm2.SetTensorB(nz_ ? w2NzGm_[bOff] : w2Gm_[bOff], true);
-        mm2.SetSingleShape(static_cast<int32_t>(td.totalS), static_cast<int32_t>(curN),
-                           static_cast<int32_t>(MLA_K2));
-        mm2.IterateAll(yGm_[n0], 0, false); // 直接写 y[S,5120]，消除 TensorMove
-    }
+        auto gA = cGm_[0];
+        auto gB = w2Gm_[0];
+        auto gC = yGm_[0];
+        auto layoutA = tla::MakeLayout<CatlassElement, Catlass::layout::zN>(td.paddedM, MLA_K2);
+        auto layoutB = tla::MakeLayout<CatlassElement, Catlass::layout::ColumnMajor>(MLA_K2, MLA_N2);
+        auto layoutC = tla::MakeLayout<CatlassElement, Catlass::layout::RowMajor>(td.totalS, MLA_N2);
+        auto tensorA = tla::MakeTensor(gA, layoutA, Catlass::Arch::PositionGM{});
+        auto tensorB = tla::MakeTensor(gB, layoutB, Catlass::Arch::PositionGM{});
+        auto tensorC = tla::MakeTensor(gC, layoutC, Catlass::Arch::PositionGM{});
 
-    /**
-     * @brief GEMM1 全部 M-段下发完毕后关闭 mm1_（必须在 Gemm2 之前调用）
-     *
-     * 根因（issue_20261111_matmul-end-mlayout_01）：mm1_ 与 mm2_ 共享同一个 TPipe。
-     * 若 mm1_ 不 End()，其 CubeInBuffer 占用的 L1 队列事件（TQueBind eventId）与 L0 池缓存不会释放；
-     * mm2_ 在推进第 2 个及以上 baseM 块（CopyCubeInA->Reset → qid_.FreeBuffer）时会死锁在
-     * 单元 flag 的硬件等待上（AICore 100%、无异常、无 stranded cqe 的挂死）。
-     * GEMM2 只有在 mm2_ 的 M 方向切成 >= 2 个 baseM 块时才会触发该路径（S 较小时单块不触发）。
-     *
-     * End() 会把硬件控制位 MM_LAYOUT_MODE（C 为 ND 时为 1，由 SchedulerBase::Init 在
-     * REGIST_MATMUL_OBJ 阶段对两个对象各设置一次）清零，而 mm2_ 的 Init 不会再执行，
-     * 故必须用 SetMMRowMajor() 恢复，否则 GEMM2 的 C 输出布局错误。
-     */
-    __aicore__ inline void CloseGemm1()
-    {
-        if (nz_) {
-            mm1Nz_.End();
-        } else {
-            mm1_.End();
+        {
+            G2Block blockMmad(resource_);
+            constexpr uint32_t kM = tla::get<0>(G2L1Shape{});
+
+            for (uint32_t m0 = 0U; m0 < td.totalS; m0 += kM) {
+                const uint32_t mAct = min(kM, td.totalS - m0);
+                // paddedM 是 c/A 的物理行数；m0 不会越过 paddedM（totalS <= paddedM）。
+                auto tileA = tla::GetTile(tensorA, tla::MakeCoord(m0, 0U), tla::MakeShape(mAct, MLA_K2));
+                auto tileB = tla::GetTile(tensorB, tla::MakeCoord(0U, n0), tla::MakeShape(MLA_K2, curN));
+                auto tileC = tla::GetTile(tensorC, tla::MakeCoord(m0, n0), tla::MakeShape(mAct, curN));
+                blockMmad(tileA, tileB, tileC, GemmCoord{mAct, curN, MLA_K2});
+            }
         }
-        AscendC::SetMMRowMajor();
     }
 
 private:
-    // 性能优化（r2）：Matmul 调度由 Norm 切换为 MDL —— MDL 按 TCubeTiling 的
-    // stepKa/stepKb/depthA1/depthB1 以大块 L1 tile 搬运（A: baseM × stepKa×baseK，
-    // B: baseN × stepKb×baseK），把 GM→L1 的 MTE2 指令数降为约 1/4~1/8，
-    // 单条搬运粒度从 ~16/25 KiB 提升到 ~80~90 KiB（对齐库 kernel 的 51~110 KiB）。
-    // baseM/baseN/baseK 不变 → L0 累加顺序不变，结果与 Norm 逐位一致。
-    Matmul<aType, bType, cTypeNz, biasType, CFG_MDL> mm1_;    // GEMM1：B 非转置，C 为 NZ
-
-    Matmul<aTypeNz, bTypeTrans, cType, biasType, CFG_MDL> mm2_; // GEMM2：A/c 为 NZ，B 转置
-    // nzConv 专用实例（运行期二选一 Init，另一套不分配）
-    Matmul<aType, bTypeNz, cTypeNz, biasType, CFG_MDL> mm1Nz_;          // GEMM1：C 为 NZ，B 为 NZ
-    Matmul<aTypeNz, bTypeTransNz, cType, biasType, CFG_MDL> mm2Nz_;     // GEMM2：A/c 为 NZ，B 转置 NZ
-    bool nz_ = false;
+    Catlass::Arch::Resource<CatlassArch>& resource_;
 
     GlobalTensor<bfloat16_t> rGm_;  // [8, paddedM, 4096]
-    GlobalTensor<bfloat16_t> cGm_;  // NZ: [8192/16][paddedM/16][16][16]
+    GlobalTensor<bfloat16_t> cGm_;  // zN: [8192/16][paddedM/16][16][16]
     GlobalTensor<bfloat16_t> w1Gm_; // [8, 4096, 1024]
     GlobalTensor<bfloat16_t> w2Gm_; // [5120, 8192]
-    GlobalTensor<bfloat16_t> w1NzGm_; // [8][N1/16][K1][16]（workspace）
-    GlobalTensor<bfloat16_t> w2NzGm_; // [K2/16][N2][16]（workspace）
     GlobalTensor<bfloat16_t> yGm_;  // [S, 5120]
 };
 

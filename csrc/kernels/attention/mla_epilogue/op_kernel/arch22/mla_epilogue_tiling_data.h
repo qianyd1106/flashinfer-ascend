@@ -31,9 +31,6 @@ constexpr uint32_t MLA_ALIGN16 = 16;  // M/N 分块对齐
 
 #pragma pack(push, 8)
 struct MlaEpilogueTilingData {
-    TCubeTiling gemm1Tiling;          // GEMM1（每 batch 的 K=4096、单核 N 列块）
-    TCubeTiling gemm2Tiling;          // GEMM2（K=8192、单核 N 列块）
-
     uint32_t totalS;                  // 真实 S（1..131072）
     uint32_t paddedM;                 // alignUp(totalS, 16)，r/c 的 M 方向分配行数
     uint32_t padRows;                 // paddedM - totalS，需清零的填充行数
@@ -63,11 +60,7 @@ struct MlaEpilogueTilingData {
     uint32_t reserved;                // 8 字节对齐占位
     uint64_t rOffset;                 // r 相对用户 workspace 起点的字节偏移（=0）
     uint64_t cOffset;                 // c 相对用户 workspace 起点的字节偏移
-    uint64_t userWorkspaceSize;       // r 区 + c 区 +（nzConv 时）w1NZ/w2NZ 区（含对齐余量）
-    uint32_t nzConv;                  // 1 = kernel 内把 w1/w2 转为 NZ 后供 GEMM 使用（按 S 门控）
-    uint32_t nzPad;                   // 8 字节对齐占位
-    uint64_t w1NzOffset;              // w1 NZ 副本相对用户 workspace 起点的字节偏移
-    uint64_t w2NzOffset;              // w2 NZ 副本相对用户 workspace 起点的字节偏移
+    uint64_t userWorkspaceSize;       // r 区 + c 区（含对齐余量）
 };
 #pragma pack(pop)
 
